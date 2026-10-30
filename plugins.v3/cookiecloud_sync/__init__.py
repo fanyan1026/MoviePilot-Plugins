@@ -1,16 +1,10 @@
 """
-CookieCloud 站点Cookie自动同步 V3
+CookieCloud 站点Cookie自动同步 V3 新版（无基类，适配 jxxghp v3 latest）
 """
 import time
 from typing import List, Dict, Optional
 import requests
 from pydantic import BaseModel, Field
-
-# ✅ 匹配你当前镜像的真实导入路径
-from app.runtime.extensions.plugin import PluginBase
-from app.runtime.extensions.plugin.types import PluginPageAction
-from app.log import logger
-from app.modules.site import SiteManager
 
 
 class CookieCloudSyncConfig(BaseModel):
@@ -33,20 +27,21 @@ class CookieCloudSyncConfig(BaseModel):
     )
 
 
-class CookieCloudSync(PluginBase[CookieCloudSyncConfig]):
+class CookieCloudSync:
+    # 【必填标识属性，loader靠这些识别】
     plugin_name = "CookieCloud 站点Cookie自动同步"
     plugin_desc = "定时拉取CookieCloud，对比expires时间，自动更新MoviePilot站点Cookie，支持手动一键同步"
-    plugin_version = "1.4.3"
+    plugin_version = "1.5.0"
     plugin_author = "custom"
     plugin_config_class = CookieCloudSyncConfig
     plugin_page_actions = [
-        PluginPageAction(action="manual_sync", name="立即同步", description="手动触发一次CookieCloud同步")
+        {"action": "manual_sync", "name": "立即同步", "description": "手动触发一次CookieCloud同步"}
     ]
 
     def __init__(self):
-        super().__init__()
-        self._site_manager = SiteManager()
         self._last_run_time = 0
+        # 配置读取：self.config 自动注入，新版框架内置
+        self._site_manager = None
 
     def get_cookiecloud_data(self) -> Optional[Dict]:
         cfg = self.config
@@ -59,10 +54,10 @@ class CookieCloudSync(PluginBase[CookieCloudSyncConfig]):
             ret = resp.json()
             if ret.get("success") is True:
                 return ret.get("data", {})
-            logger.error(f"CookieCloud接口返回失败 {ret}")
+            print(f"CookieCloud接口返回失败 {ret}")
             return None
         except Exception as e:
-            logger.error(f"请求CookieCloud异常 {str(e)}")
+            print(f"请求CookieCloud异常 {str(e)}")
             return None
 
     @staticmethod
@@ -85,52 +80,53 @@ class CookieCloudSync(PluginBase[CookieCloudSyncConfig]):
     def sync_one_domain(self, domain: str, cc_data: Dict):
         cc_cookies = self.get_domain_cookies(cc_data, domain)
         if cc_cookies is None:
-            logger.warning(f"[{domain}] CookieCloud未找到该域名记录，跳过")
+            print(f"[{domain}] CookieCloud未找到该域名记录，跳过")
             return
         if not cc_cookies:
-            logger.warning(f"[{domain}] CookieCloud存在域名，但cookie为空，跳过")
+            print(f"[{domain}] CookieCloud存在域名，但cookie为空，跳过")
             return
 
         cc_exp = self.max_expire_ts(cc_cookies)
         if cc_exp <= 0:
-            logger.warning(f"[{domain}] CookieCloud cookie无有效expires，无法判断新旧，跳过")
+            print(f"[{domain}] CookieCloud cookie无有效expires，无法判断新旧，跳过")
             return
 
-        site = self._site_manager.get_site_by_domain(domain)
+        # 站点查询，新版SDK获取站点
+        site = self.site_manager.get_site_by_domain(domain)
         if not site:
-            logger.warning(f"[{domain}] MoviePilot内不存在该站点，跳过")
+            print(f"[{domain}] MoviePilot内不存在该站点，跳过")
             return
 
         mp_exp = self.max_expire_ts(site.cookies or [])
         if cc_exp > mp_exp:
-            logger.info(f"[{domain}] CC更新(CC:{cc_exp} > MP:{mp_exp})，更新站点Cookie")
-            self._site_manager.update_site_cookies(site_id=site.id, cookies=cc_cookies)
-            logger.info(f"[{domain}] Cookie更新完成")
+            print(f"[{domain}] CC更新(CC:{cc_exp} > MP:{mp_exp})，更新站点Cookie")
+            self.site_manager.update_site_cookies(site_id=site.id, cookies=cc_cookies)
+            print(f"[{domain}] Cookie更新完成")
         else:
-            logger.info(f"[{domain}] MP Cookie已是最新，无需更新(CC:{cc_exp} <= MP:{mp_exp})")
+            print(f"[{domain}] MP Cookie已是最新，无需更新(CC:{cc_exp} <= MP:{mp_exp})")
 
     def run_sync_job(self):
         cfg = self.config
         if not cfg.cookiecloud_url or not cfg.cookiecloud_uuid or not cfg.cookiecloud_key:
-            logger.error("CookieCloud配置缺失，请填写地址、UUID、私钥")
+            print("CookieCloud配置缺失，请填写地址、UUID、私钥")
             return
         raw_domains = cfg.site_domains.strip()
         if not raw_domains:
-            logger.error("未配置待同步域名列表")
+            print("未配置待同步域名列表")
             return
         domains = [d.strip() for d in raw_domains.split(",") if d.strip()]
-        logger.info(f"===== CookieCloud同步开始，目标域名 {domains} =====")
+        print(f"===== CookieCloud同步开始，目标域名 {domains} =====")
         cc_data = self.get_cookiecloud_data()
         if not cc_data:
-            logger.error("获取CookieCloud数据失败，本次同步终止")
+            print("获取CookieCloud数据失败，本次同步终止")
             return
         for dom in domains:
             self.sync_one_domain(dom, cc_data)
-        logger.info("===== CookieCloud同步结束 =====\n")
+        print("===== CookieCloud同步结束 =====\n")
 
     def handle_page_action(self, action: str, data: dict):
         if action == "manual_sync":
-            logger.info("收到【立即同步】按钮指令")
+            print("收到【立即同步】按钮指令")
             self.run_sync_job()
             return {"msg": "同步执行完毕，请查看系统日志", "success": True}
         return {"msg": "未知操作", "success": False}
@@ -143,5 +139,6 @@ class CookieCloudSync(PluginBase[CookieCloudSyncConfig]):
             self.run_sync_job()
             self._last_run_time = now_ts
 
-# 必须导出，加载器识别主类
+
+# 必须导出，loader扫描顶层类
 __all__ = ["CookieCloudSync"]
