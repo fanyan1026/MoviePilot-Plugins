@@ -1,10 +1,10 @@
 {
-  "CookieCloudSync": {
-    "version": "1.5.0",
-    "name": "CookieCloud 站点Cookie自动同步",
-    "description": "定时拉取CookieCloud，对比expires时间，自动更新MoviePilot站点Cookie",
+  "CookieCloudToMP": {
+    "version": "1.0",
+    "name": "CookieCloud拉取同步站点Cookie",
+    "description": "从外部CookieCloud服务器拉取Cookie，对比expires，自动更新MoviePilot站点Cookie",
     "author": "fanyan1026",
-    "icon": "",
+    "icon": "Cookiecloud_A.png",
     "dependencies": []
   }
 }
