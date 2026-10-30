@@ -3,7 +3,7 @@
     "version": "1.5.0",
     "name": "CookieCloud 站点Cookie自动同步",
     "description": "定时拉取CookieCloud，对比expires时间，自动更新MoviePilot站点Cookie",
-    "author": "custom",
+    "author": "fanyan1026",
     "icon": "",
     "dependencies": []
   }
