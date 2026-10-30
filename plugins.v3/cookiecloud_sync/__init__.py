@@ -1,13 +1,14 @@
 """
-CookieCloud 站点Cookie自动同步 V3
-从CookieCloud拉取cookie，expires更大则更新MP站点cookie
+CookieCloud 站点Cookie自动同步 V3 适配新版MoviePilot
+从CookieCloud拉取cookie，对比expires时间，自动更新MP站点Cookie
 """
 import time
 from typing import List, Dict, Optional
 import requests
 from pydantic import BaseModel, Field
 
-from app.core.plugin import PluginBase
+# ✅ 新版V3正确导入路径
+from app.runtime.extensions.plugin import PluginBase
 from app.log import logger
 from app.modules.site import SiteManager
 from app.schemas.types import PluginPageAction
@@ -36,7 +37,7 @@ class CookieCloudSyncConfig(BaseModel):
 class CookieCloudSync(PluginBase[CookieCloudSyncConfig]):
     plugin_name = "CookieCloud 站点Cookie自动同步"
     plugin_desc = "定时拉取CookieCloud，对比expires时间，自动更新MoviePilot站点Cookie，支持手动一键同步"
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "custom"
     plugin_config_class = CookieCloudSyncConfig
     plugin_page_actions = [
