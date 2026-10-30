@@ -1,0 +1,13 @@
+{
+  "plugins": [
+    {
+      "id": "cookiecloud_sync",
+      "name": "CookieCloud站点Cookie自动同步",
+      "version": "1.4.0",
+      "description": "定时拉取CookieCloud，对比expires时间，自动更新MoviePilot站点Cookie，支持手动一键同步",
+      "author": "custom",
+      "repository": "https://github.com/fanyan1026/mp-v3-plugins",
+      "branch": "main"
+    }
+  ]
+}
