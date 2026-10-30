@@ -1,144 +1,272 @@
-"""
-CookieCloud 站点Cookie自动同步 V3 新版（无基类，适配 jxxghp v3 latest）
-"""
-import time
-from typing import List, Dict, Optional
+import json
+from datetime import datetime, timedelta
+from typing import Any, List, Dict, Tuple, Optional
+import pytz
 import requests
-from pydantic import BaseModel, Field
+from urllib.parse import urlparse
+
+from app.core.config import settings
+from app.db.site_oper import SiteOper
+from app.plugins import _PluginBase
+from app.log import logger
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 
-class CookieCloudSyncConfig(BaseModel):
-    cookiecloud_url: str = Field(
-        default="http://127.0.0.1:8088",
-        title="CookieCloud服务地址",
-        description="示例 http://192.168.1.100:8088，末尾不要斜杠"
-    )
-    cookiecloud_uuid: str = Field(default="", title="CookieCloud UUID")
-    cookiecloud_key: str = Field(default="", title="CookieCloud 私钥")
-    sync_interval: int = Field(
-        default=30,
-        title="自动同步间隔(分钟)",
-        description="最小5分钟，低于5自动按5分钟执行"
-    )
-    site_domains: str = Field(
-        default="",
-        title="待同步域名列表",
-        description="多个域名英文逗号分隔，例：hdtime.org,ultrahd.net,ahdbits.org"
-    )
-
-
-class CookieCloudSync:
-    # 【必填标识属性，loader靠这些识别】
-    plugin_name = "CookieCloud 站点Cookie自动同步"
-    plugin_desc = "定时拉取CookieCloud，对比expires时间，自动更新MoviePilot站点Cookie，支持手动一键同步"
-    plugin_version = "1.5.0"
+class CookieCloudToMP(_PluginBase):
+    # 插件基础信息（和样板格式保持一致）
+    plugin_name = "CookieCloud拉取同步站点Cookie"
+    plugin_desc = "从外部CookieCloud服务器拉取Cookie，对比expires，自动更新MoviePilot站点Cookie"
+    plugin_icon = "Cookiecloud_A.png"
+    plugin_version = "1.0"
     plugin_author = "custom"
-    plugin_config_class = CookieCloudSyncConfig
-    plugin_page_actions = [
-        {"action": "manual_sync", "name": "立即同步", "description": "手动触发一次CookieCloud同步"}
-    ]
+    author_url = ""
+    plugin_config_prefix = "cookiecloudtmp_"
+    plugin_order = 99
+    auth_level = 1
 
-    def __init__(self):
-        self._last_run_time = 0
-        # 配置读取：self.config 自动注入，新版框架内置
-        self._site_manager = None
+    # 私有变量
+    _enabled: bool = False
+    _onlyonce: bool = False
+    _cron: str = ""
+    _cc_url: str = ""
+    _cc_uuid: str = ""
+    _cc_pwd: str = ""
+    _scheduler: Optional[BackgroundScheduler] = None
+    _siteoper = SiteOper()
 
-    def get_cookiecloud_data(self) -> Optional[Dict]:
-        cfg = self.config
-        base_url = cfg.cookiecloud_url.rstrip("/")
-        url = f"{base_url}/api/get"
-        params = {"uuid": cfg.cookiecloud_uuid, "privateKey": cfg.cookiecloud_key}
+    def init_plugin(self, config: dict = None):
+        self.stop_service()
+        if config:
+            self._enabled = config.get("enabled")
+            self._onlyonce = config.get("onlyonce")
+            self._cron = config.get("cron")
+            self._cc_url = config.get("cc_url", "").strip()
+            self._cc_uuid = config.get("cc_uuid", "").strip()
+            self._cc_pwd = config.get("cc_pwd", "").strip()
+
+            if self._enabled or self._onlyonce:
+                self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+                if self._onlyonce:
+                    logger.info("CookieCloud拉取同步：立即执行一次")
+                    self._scheduler.add_job(self.__sync_from_cc, 'date',
+                                            run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                                            name="CC拉取Cookie")
+                    self._onlyonce = False
+                    self.__update_config()
+                if self._cron:
+                    try:
+                        self._scheduler.add_job(func=self.__sync_from_cc,
+                                                trigger=CronTrigger.from_crontab(self._cron),
+                                                name="CC拉取Cookie")
+                    except Exception as err:
+                        logger.error(f"定时表达式错误：{err}")
+                        self.systemmessage.put(f"执行周期配置错误：{err}")
+                if self._scheduler.get_jobs():
+                    self._scheduler.start()
+
+    def __sync_from_cc(self):
+        """从CookieCloud拉取，对比过期时间，更新站点Cookie"""
+        if not all([self._cc_url, self._cc_uuid, self._cc_pwd]):
+            logger.error("CookieCloud地址、UUID、密码不能为空！")
+            return
         try:
-            resp = requests.get(url, params=params, timeout=15)
+            resp = requests.get(f"{self._cc_url.rstrip('/')}/api/get", params={
+                "uuid": self._cc_uuid,
+                "privateKey": self._cc_pwd
+            }, timeout=15)
             resp.raise_for_status()
             ret = resp.json()
-            if ret.get("success") is True:
-                return ret.get("data", {})
-            print(f"CookieCloud接口返回失败 {ret}")
-            return None
+            if not ret.get("success"):
+                logger.error(f"CookieCloud返回失败：{ret}")
+                return
+            cc_data = ret.get("data", {})
+            cookie_data = cc_data.get("cookie_data", {})
         except Exception as e:
-            print(f"请求CookieCloud异常 {str(e)}")
-            return None
+            logger.error(f"请求CookieCloud异常：{str(e)}")
+            return
+
+        # 遍历CC里的每个域名
+        for domain, ck_list in cookie_data.items():
+            if not ck_list:
+                continue
+            # 找出该域名对应的MP站点
+            site = self._siteoper.get_by_domain(domain)
+            if not site:
+                logger.warning(f"MP内不存在站点：{domain}，跳过")
+                continue
+            # 取CC里cookie最大过期时间
+            cc_exp = 0
+            for ck in ck_list:
+                exp = ck.get("expires", 0)
+                if isinstance(exp, (int, float)) and exp > cc_exp:
+                    cc_exp = exp
+            # 读取现有站点cookie的最大过期时间
+            mp_exp = 0
+            if site.cookie:
+                try:
+                    old_cookies = json.loads(site.cookie)
+                    for ck in old_cookies:
+                        exp = ck.get("expires", 0)
+                        if isinstance(exp, (int, float)) and exp > mp_exp:
+                            mp_exp = exp
+                except Exception:
+                    pass
+            # CC更新，才写入
+            if cc_exp > mp_exp:
+                self._siteoper.update_cookie(site.id, json.dumps(ck_list, ensure_ascii=False))
+                logger.info(f"【{domain}】Cookie已更新，新过期时间：{cc_exp}")
+            else:
+                logger.info(f"【{domain}】Cookie无需更新，CC过期时间不优于本地")
+        logger.info("CookieCloud同步任务执行完毕")
+
+    def __update_config(self):
+        self.update_config({
+            "enabled": self._enabled,
+            "onlyonce": self._onlyonce,
+            "cron": self._cron,
+            "cc_url": self._cc_url,
+            "cc_uuid": self._cc_uuid,
+            "cc_pwd": self._cc_pwd
+        })
+
+    def get_state(self) -> bool:
+        return self._enabled
 
     @staticmethod
-    def get_domain_cookies(cc_data: Dict, target_domain: str) -> Optional[List[Dict]]:
-        cookie_groups = cc_data.get("cookie_data", [])
-        for g in cookie_groups:
-            if g.get("domain") == target_domain:
-                return g.get("cookies", [])
-        return None
+    def get_command() -> List[Dict[str, Any]]:
+        return []
 
-    @staticmethod
-    def max_expire_ts(cookies: List[Dict]) -> int:
-        ts_list = []
-        for c in cookies:
-            exp = c.get("expires")
-            if isinstance(exp, (int, float)) and exp > 0:
-                ts_list.append(int(exp))
-        return max(ts_list) if ts_list else 0
+    def get_api(self) -> List[Dict[str, Any]]:
+        return []
 
-    def sync_one_domain(self, domain: str, cc_data: Dict):
-        cc_cookies = self.get_domain_cookies(cc_data, domain)
-        if cc_cookies is None:
-            print(f"[{domain}] CookieCloud未找到该域名记录，跳过")
-            return
-        if not cc_cookies:
-            print(f"[{domain}] CookieCloud存在域名，但cookie为空，跳过")
-            return
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        """配置表单页面"""
+        return [
+            {
+                'component': 'VForm',
+                'content': [
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {'model': 'enabled', 'label': '启用插件'}
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {'model': 'onlyonce', 'label': '立即运行一次'}
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {'model': 'cc_url', 'label': 'CookieCloud地址',
+                                                  'placeholder': 'http://192.168.x.x:8088'}
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md':6},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {'model': 'cc_uuid', 'label': 'CookieCloud UUID'}
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md':6},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {'model': 'cc_pwd', 'label': 'CookieCloud 密码'}
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VCronField',
+                                        'props': {'model': 'cron', 'label': '执行周期', 'placeholder': '5位cron'}
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {'type': 'info', 'variant': 'tonal',
+                                                  'text': '从外部CookieCloud拉取Cookie，对比expires，仅当新Cookie过期时间更晚才更新站点Cookie。'}
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        ], {
+            "enabled": False,
+            "onlyonce": False,
+            "cron": "0 */2 * * *",
+            "cc_url": "",
+            "cc_uuid": "",
+            "cc_pwd": ""
+        }
 
-        cc_exp = self.max_expire_ts(cc_cookies)
-        if cc_exp <= 0:
-            print(f"[{domain}] CookieCloud cookie无有效expires，无法判断新旧，跳过")
-            return
+    def get_page(self) -> List[dict]:
+        return []
 
-        # 站点查询，新版SDK获取站点
-        site = self.site_manager.get_site_by_domain(domain)
-        if not site:
-            print(f"[{domain}] MoviePilot内不存在该站点，跳过")
-            return
-
-        mp_exp = self.max_expire_ts(site.cookies or [])
-        if cc_exp > mp_exp:
-            print(f"[{domain}] CC更新(CC:{cc_exp} > MP:{mp_exp})，更新站点Cookie")
-            self.site_manager.update_site_cookies(site_id=site.id, cookies=cc_cookies)
-            print(f"[{domain}] Cookie更新完成")
-        else:
-            print(f"[{domain}] MP Cookie已是最新，无需更新(CC:{cc_exp} <= MP:{mp_exp})")
-
-    def run_sync_job(self):
-        cfg = self.config
-        if not cfg.cookiecloud_url or not cfg.cookiecloud_uuid or not cfg.cookiecloud_key:
-            print("CookieCloud配置缺失，请填写地址、UUID、私钥")
-            return
-        raw_domains = cfg.site_domains.strip()
-        if not raw_domains:
-            print("未配置待同步域名列表")
-            return
-        domains = [d.strip() for d in raw_domains.split(",") if d.strip()]
-        print(f"===== CookieCloud同步开始，目标域名 {domains} =====")
-        cc_data = self.get_cookiecloud_data()
-        if not cc_data:
-            print("获取CookieCloud数据失败，本次同步终止")
-            return
-        for dom in domains:
-            self.sync_one_domain(dom, cc_data)
-        print("===== CookieCloud同步结束 =====\n")
-
-    def handle_page_action(self, action: str, data: dict):
-        if action == "manual_sync":
-            print("收到【立即同步】按钮指令")
-            self.run_sync_job()
-            return {"msg": "同步执行完毕，请查看系统日志", "success": True}
-        return {"msg": "未知操作", "success": False}
-
-    def plugin_run(self):
-        cfg = self.config
-        interval = max(5, cfg.sync_interval) * 60
-        now_ts = time.time()
-        if now_ts - self._last_run_time >= interval:
-            self.run_sync_job()
-            self._last_run_time = now_ts
+    def stop_service(self):
+        """停止定时任务"""
+        try:
+            if self._scheduler:
+                self._scheduler.remove_all_jobs()
+                if self._scheduler.running:
+                    self._scheduler.shutdown()
+                self._scheduler = None
+        except Exception as e:
+            logger.error("退出插件失败：%s" % str(e))
 
 
-# 必须导出，loader扫描顶层类
-__all__ = ["CookieCloudSync"]
+__all__ = ["CookieCloudToMP"]
